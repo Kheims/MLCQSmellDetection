@@ -9,8 +9,11 @@ from torch.utils.data import DataLoader, Dataset
 from time import time 
 import re
 
-from model import LSTMCodeSmellClassifier
+from model import LSTMModel, LSTMConfig
+from config import (LSTMConfig, OptimizerConfig, SchedulerConfig, TrainingConfig, 
+                    get_optimizer, get_scheduler)
 
+# ----------------------------- Data Prep -------------------------------------------------------------
 with open("MLCQCodeSmellSamples.json", "r") as f:
     data = json.load(f)
 
@@ -27,12 +30,15 @@ tokenized_data = [simple_tokenizer(entry["code_snippet"]) for entry in data]
 
 # Create vocabulary from tokenized data
 vocab = set(token for snippet in tokenized_data for token in snippet)
+vocab.add("<UNK>")
+vocab.add("<PAD>")
 vocab_size = len(vocab)
 token_to_idx = {token: idx for idx, token in enumerate(vocab)}
+pad_idx = token_to_idx["<PAD>"]
 
 # Convert tokenized data to indexed sequences
 def encode_snippet(snippet):
-    return [token_to_idx[token] for token in snippet]
+    return [token_to_idx.get(token, token_to_idx["<UNK>"]) for token in snippet]
 
 encoded_data = [encode_snippet(snippet) for snippet in tokenized_data]
 
@@ -40,7 +46,7 @@ encoded_data = [encode_snippet(snippet) for snippet in tokenized_data]
 max_len = 1000  
 def pad_sequence(seq, max_len):
     if len(seq) < max_len:
-        return seq + [0] * (max_len - len(seq))  # Padding with 0
+        return seq + [pad_idx] * (max_len - len(seq))  # Padding with 0
     else:
         return seq[:max_len]  # Truncate to max_len
 
@@ -70,37 +76,68 @@ test_dataset = CodeSmellDataset(X_test_tensor, y_test_tensor)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-vocab_size = len(vocab)
-embed_size = 128  
-hidden_size = 256 
-num_classes = len(label_encoder.classes_)  
 
-model = LSTMCodeSmellClassifier(vocab_size, embed_size, hidden_size, num_classes)
 
+# ---------------------------------------------------------------------------------------------------#
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+model_config = LSTMConfig(
+    vocab_size=len(vocab),  
+    embedding_dim=256, 
+    hidden_dim=512,    
+    num_layers=3,      
+    dropout=0.2,       
+    max_seq_len=512,   
+    num_classes=4      
+)
+model = LSTMModel(model_config)
+model.to(device)
+
+optimizer_config = OptimizerConfig(optimizer_type="Adam", learning_rate=1e-4, weight_decay=0.01)
+scheduler_config = SchedulerConfig(scheduler_type="step", step_size=10, gamma=0.5)
+
+
+optimizer = get_optimizer(model, optimizer_config)
+scheduler = get_scheduler(optimizer, scheduler_config)
+
+training_config = TrainingConfig(batch_size=8, epochs=10, clip_grad=1.0)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
+def train_model(model, train_loader, optimizer, scheduler=None, training_config=None):
     model.train()
-    for epoch in range(num_epochs):
+    for epoch in range(training_config.epochs):
         start_time = time()
         running_loss = 0.0
         for inputs, labels in train_loader:
+
+            inputs, labels = inputs.to(device), labels.to(device)
+
             optimizer.zero_grad()
             
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             
             loss.backward()
+
+            if training_config.clip_grad is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), training_config.clip_grad)
+            
             optimizer.step()
+
+            if scheduler is not None:
+                scheduler.step()
             
             running_loss += loss.item()
 
         epoch_time = time() - start_time
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f} | duration: {epoch_time:.3f}")
+        print(f"Epoch [{epoch+1}/{training_config.epochs}], Loss: {running_loss/len(train_loader):.4f} | duration: {epoch_time:.3f}")
 
-train_model(model, train_loader, criterion, optimizer)
+train_model(model, train_loader, optimizer, scheduler, training_config)
+
+# -----------------------------------------------------------------------------------------------#
 
 
 def evaluate_model(model, test_loader):
