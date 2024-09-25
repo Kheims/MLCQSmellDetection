@@ -43,3 +43,39 @@ class LSTMModel(nn.Module):
         output = self.fc(output)  # (batch_size, num_classes)
         
         return output
+    
+
+class LSTMMLCQ(nn.Module):
+    def __init__(self, config: LSTMConfig, use_pretrained_embeddings=False):
+        super(LSTMMLCQ, self).__init__()
+
+        
+        self.use_pretrained_embeddings = use_pretrained_embeddings
+
+        if not use_pretrained_embeddings:
+            self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim)
+
+
+        self.lstm = nn.LSTM(input_size=config.embedding_dim if not use_pretrained_embeddings else 768,
+                            hidden_size=config.hidden_dim,
+                            num_layers=config.num_layers,
+                            batch_first=True,
+                            dropout=config.dropout)
+        
+        self.dropout = nn.Dropout(config.dropout)
+        
+        self.fc = nn.Linear(config.hidden_dim, config.num_classes)
+    
+    def forward(self, x):
+        # x shape: (batch_size, sequence_length)
+        if not self.use_pretrained_embeddings:
+            x = self.embedding(x)  # (batch_size, sequence_length, embedding_dim)
+        
+        lstm_out, (h_n, c_n) = self.lstm(x)  # (batch_size, sequence_length, hidden_dim)
+        
+        lstm_out = lstm_out[:, -1, :]  # (batch_size, hidden_dim)
+        
+        output = self.dropout(lstm_out)
+        output = self.fc(output)  # (batch_size, num_classes)
+        
+        return output

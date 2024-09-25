@@ -9,55 +9,61 @@ from torch.utils.data import DataLoader, Dataset
 from time import time 
 import re
 
-from model import LSTMModel, LSTMConfig
+from model import LSTMModel, LSTMConfig, LSTMMLCQ
 from config import (LSTMConfig, OptimizerConfig, SchedulerConfig, TrainingConfig, 
                     get_optimizer, get_scheduler)
+from custom_tokenizers import SimpleTokenizer, BertTokenizer, TokenizerContext
 
 # ----------------------------- Data Prep -------------------------------------------------------------
 with open("MLCQCodeSmellSamples.json", "r") as f:
     data = json.load(f)
 
-# Tokenizer: split by whitespace and punctuation
-def simple_tokenizer(code_snippet):
-    tokens = re.findall(r'\w+|\S', code_snippet)  # Basic split by non-alphanumeric chars
-    return tokens
+codebert_tokenizer = BertTokenizer()
+simple_tokenizer = SimpleTokenizer()
+
+
+tokenizer_context = TokenizerContext(codebert_tokenizer)
+
+tokenized_data = [tokenizer_context.tokenize(entry["code_snippet"]) for entry in data]
 
 label_encoder = LabelEncoder()
 labels = [entry["smell"] for entry in data]
 encoded_labels = label_encoder.fit_transform(labels)  
 
-tokenized_data = [simple_tokenizer(entry["code_snippet"]) for entry in data]
 
-# Create vocabulary from tokenized data
-vocab = set(token for snippet in tokenized_data for token in snippet)
-vocab.add("<UNK>")
-vocab.add("<PAD>")
-vocab_size = len(vocab)
-token_to_idx = {token: idx for idx, token in enumerate(vocab)}
-pad_idx = token_to_idx["<PAD>"]
 
-# Convert tokenized data to indexed sequences
-def encode_snippet(snippet):
-    return [token_to_idx.get(token, token_to_idx["<UNK>"]) for token in snippet]
+## Create vocabulary from tokenized data
+#vocab = set(token for snippet in tokenized_data for token in snippet)
+#vocab.add("<UNK>")
+#vocab.add("<PAD>")
+#vocab_size = len(vocab)
+#token_to_idx = {token: idx for idx, token in enumerate(vocab)}
+#pad_idx = token_to_idx["<PAD>"]
+#
+## Convert tokenized data to indexed sequences
+#def encode_snippet(snippet):
+#    return [token_to_idx.get(token, token_to_idx["<UNK>"]) for token in snippet]
+#
+#encoded_data = [encode_snippet(snippet) for snippet in tokenized_data]
+#
+## Padding and truncating to a fixed length
+#max_len = 1000  
+#def pad_sequence(seq, max_len):
+#    if len(seq) < max_len:
+#        return seq + [pad_idx] * (max_len - len(seq))  # Padding with 0
+#    else:
+#        return seq[:max_len]  # Truncate to max_len
+#
+#padded_data = [pad_sequence(seq, max_len) for seq in encoded_data]
 
-encoded_data = [encode_snippet(snippet) for snippet in tokenized_data]
+X_train, X_test, y_train, y_test = train_test_split(tokenized_data, encoded_labels, test_size=0.2, random_state=42)
 
-# Padding and truncating to a fixed length
-max_len = 1000  
-def pad_sequence(seq, max_len):
-    if len(seq) < max_len:
-        return seq + [pad_idx] * (max_len - len(seq))  # Padding with 0
-    else:
-        return seq[:max_len]  # Truncate to max_len
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-padded_data = [pad_sequence(seq, max_len) for seq in encoded_data]
-
-X_train, X_test, y_train, y_test = train_test_split(padded_data, encoded_labels, test_size=0.2, random_state=42)
-
-X_train_tensor = torch.tensor(X_train, dtype=torch.long)
-X_test_tensor = torch.tensor(X_test, dtype=torch.long)
-y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+X_train_tensor = torch.tensor(X_train, dtype=torch.long).to(device)
+X_test_tensor = torch.tensor(X_test, dtype=torch.long).to(device)
+y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
+y_test_tensor = torch.tensor(y_test, dtype=torch.long).to(device)
 
 class CodeSmellDataset(Dataset):
     def __init__(self, X, y):
@@ -70,6 +76,7 @@ class CodeSmellDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
+
 train_dataset = CodeSmellDataset(X_train_tensor, y_train_tensor)
 test_dataset = CodeSmellDataset(X_test_tensor, y_test_tensor)
 
@@ -80,19 +87,17 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 # ---------------------------------------------------------------------------------------------------#
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 model_config = LSTMConfig(
-    vocab_size=len(vocab),  
+    vocab_size=codebert_tokenizer.tokenizer.vocab_size if tokenizer_context.strategy.provides_embeddings() else None,  
     embedding_dim=256, 
     hidden_dim=512,    
-    num_layers=3,      
+    num_layers=1,      
     dropout=0.2,       
     max_seq_len=512,   
     num_classes=4      
 )
-model = LSTMModel(model_config)
+model = LSTMMLCQ(model_config, tokenizer_context.strategy.provides_embeddings())
 model.to(device)
 
 optimizer_config = OptimizerConfig(optimizer_type="Adam", learning_rate=1e-4, weight_decay=0.01)
@@ -102,7 +107,7 @@ scheduler_config = SchedulerConfig(scheduler_type="step", step_size=10, gamma=0.
 optimizer = get_optimizer(model, optimizer_config)
 scheduler = get_scheduler(optimizer, scheduler_config)
 
-training_config = TrainingConfig(batch_size=8, epochs=10, clip_grad=1.0)
+training_config = TrainingConfig(batch_size=8, epochs=10, clip_grad=None)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -115,7 +120,13 @@ def train_model(model, train_loader, optimizer, scheduler=None, training_config=
 
             inputs, labels = inputs.to(device), labels.to(device)
 
+
+            inputs, labels = inputs.to(device), labels.to(device)
+
             optimizer.zero_grad()
+
+            if tokenizer_context.strategy.provides_embeddings():
+                inputs = tokenizer_context.strategy.get_embeddings(inputs).to(device)
             
             outputs = model(inputs)
             loss = criterion(outputs, labels)
@@ -125,7 +136,14 @@ def train_model(model, train_loader, optimizer, scheduler=None, training_config=
             if training_config.clip_grad is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), training_config.clip_grad)
             
+
+            if training_config.clip_grad is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), training_config.clip_grad)
+            
             optimizer.step()
+
+            if scheduler is not None:
+                scheduler.step()
 
             if scheduler is not None:
                 scheduler.step()
@@ -135,8 +153,10 @@ def train_model(model, train_loader, optimizer, scheduler=None, training_config=
         epoch_time = time() - start_time
         print(f"Epoch [{epoch+1}/{training_config.epochs}], Loss: {running_loss/len(train_loader):.4f} | duration: {epoch_time:.3f}")
 
+
 train_model(model, train_loader, optimizer, scheduler, training_config)
 
+# -----------------------------------------------------------------------------------------------#
 # -----------------------------------------------------------------------------------------------#
 
 
@@ -147,6 +167,11 @@ def evaluate_model(model, test_loader):
 
     with torch.no_grad():
         for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            if tokenizer_context.strategy.provides_embeddings():
+                inputs = tokenizer_context.strategy.get_embeddings(inputs).to(device)
+
             outputs = model(inputs)
             _, predicted = torch.max(outputs, 1)
             y_true.extend(labels.cpu().numpy())
